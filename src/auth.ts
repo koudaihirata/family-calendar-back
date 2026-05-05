@@ -6,9 +6,11 @@ import type { Bindings } from './types'
 
 const auth = new Hono<{ Bindings: Bindings }>()
 
+// トークンの有効期限（秒）
 const ACCESS_EXPIRY  = 7  * 24 * 60 * 60  // 7日
 const REFRESH_EXPIRY = 30 * 24 * 60 * 60  // 30日
 
+// Cookie 共通オプション
 const cookieBase = {
   httpOnly: true,
   secure: true,
@@ -16,6 +18,9 @@ const cookieBase = {
   path: '/',
 }
 
+// ────────────────────────────────
+// パスワードハッシュ（PBKDF2）
+// ────────────────────────────────
 async function hashPassword(password: string): Promise<string> {
   const enc  = new TextEncoder()
   const salt = crypto.getRandomValues(new Uint8Array(16))
@@ -40,6 +45,7 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
   )
   const actual = new Uint8Array(bits)
   if (actual.length !== expected.length) return false
+  // タイミング攻撃対策の定数時間比較
   let diff = 0
   for (let i = 0; i < actual.length; i++) diff |= actual[i] ^ expected[i]
   return diff === 0
@@ -49,29 +55,29 @@ async function verifyPassword(password: string, stored: string): Promise<boolean
 // POST /register — 新規ユーザー登録
 // ────────────────────────────────
 auth.post('/register', async (c) => {
-  const { email, password, name } = await c.req.json()
+  const { email, password, display_name } = await c.req.json()
 
-  if (!email || !password || !name) {
-    return c.json({ error: 'email・password・name は必須です' }, 400)
+  if (!email || !password || !display_name) {
+    return c.json({ error: 'email・password・display_name は必須です' }, 400)
   }
 
   const existing = await c.env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first()
   if (existing) return c.json({ error: 'このメールアドレスは既に使用されています' }, 409)
 
-  const id            = crypto.randomUUID()
   const password_hash = await hashPassword(password)
-  const now           = new Date().toISOString()
+  const now = new Date().toISOString()
 
-  await c.env.DB.prepare(`
-    INSERT INTO users (id, name, email, password_hash, created_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).bind(id, name, email, password_hash, now).run()
+  const result = await c.env.DB.prepare(`
+    INSERT INTO users (email, password_hash, display_name, created_at, updated_at, delete_flag, version)
+    VALUES (?, ?, ?, ?, ?, 0, 1)
+  `).bind(email, password_hash, display_name, now, now).run()
 
-  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first() as any
+  const user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?')
+    .bind(result.meta.last_row_id).first() as any
 
   const nowSec = Math.floor(Date.now() / 1000)
-  const accessToken  = await sign({ sub: user.id, exp: nowSec + ACCESS_EXPIRY  }, c.env.JWT_SECRET, 'HS256')
-  const refreshToken = await sign({ sub: user.id, type: 'refresh', exp: nowSec + REFRESH_EXPIRY }, c.env.JWT_SECRET, 'HS256')
+  const accessToken  = await sign({ sub: String(user.id), exp: nowSec + ACCESS_EXPIRY  }, c.env.JWT_SECRET, 'HS256')
+  const refreshToken = await sign({ sub: String(user.id), type: 'refresh', exp: nowSec + REFRESH_EXPIRY }, c.env.JWT_SECRET, 'HS256')
 
   setCookie(c, 'access_token',  accessToken,  { ...cookieBase, maxAge: ACCESS_EXPIRY  })
   setCookie(c, 'refresh_token', refreshToken, { ...cookieBase, maxAge: REFRESH_EXPIRY })
@@ -91,16 +97,16 @@ auth.post('/login', async (c) => {
   }
 
   const user = await c.env.DB.prepare(
-    'SELECT * FROM users WHERE email = ?'
+    'SELECT * FROM users WHERE email = ? AND delete_flag = 0'
   ).bind(email).first() as any
 
-  if (!user || !user.password_hash || !(await verifyPassword(password, user.password_hash))) {
+  if (!user || !(await verifyPassword(password, user.password_hash))) {
     return c.json({ error: 'メールアドレスまたはパスワードが違います' }, 401)
   }
 
   const nowSec = Math.floor(Date.now() / 1000)
-  const accessToken  = await sign({ sub: user.id, exp: nowSec + ACCESS_EXPIRY  }, c.env.JWT_SECRET, 'HS256')
-  const refreshToken = await sign({ sub: user.id, type: 'refresh', exp: nowSec + REFRESH_EXPIRY }, c.env.JWT_SECRET, 'HS256')
+  const accessToken  = await sign({ sub: String(user.id), exp: nowSec + ACCESS_EXPIRY  }, c.env.JWT_SECRET, 'HS256')
+  const refreshToken = await sign({ sub: String(user.id), type: 'refresh', exp: nowSec + REFRESH_EXPIRY }, c.env.JWT_SECRET, 'HS256')
 
   setCookie(c, 'access_token',  accessToken,  { ...cookieBase, maxAge: ACCESS_EXPIRY  })
   setCookie(c, 'refresh_token', refreshToken, { ...cookieBase, maxAge: REFRESH_EXPIRY })
@@ -119,8 +125,8 @@ auth.get('/me', async (c) => {
     try {
       const payload = await verify(accessToken, c.env.JWT_SECRET, 'HS256')
       const user = await c.env.DB.prepare(
-        'SELECT * FROM users WHERE id = ?'
-      ).bind(payload.sub).first() as any
+        'SELECT * FROM users WHERE id = ? AND delete_flag = 0'
+      ).bind(Number(payload.sub)).first() as any
 
       if (user) {
         const { password_hash, ...safeUser } = user
@@ -135,13 +141,14 @@ auth.get('/me', async (c) => {
   try {
     const payload = await verify(refreshToken, c.env.JWT_SECRET, 'HS256')
     const user = await c.env.DB.prepare(
-      'SELECT * FROM users WHERE id = ?'
-    ).bind(payload.sub).first() as any
+      'SELECT * FROM users WHERE id = ? AND delete_flag = 0'
+    ).bind(Number(payload.sub)).first() as any
 
     if (!user) return c.json({ error: 'Unauthorized' }, 401)
 
+    // access_token を再発行
     const nowSec = Math.floor(Date.now() / 1000)
-    const newAccessToken = await sign({ sub: user.id, exp: nowSec + ACCESS_EXPIRY }, c.env.JWT_SECRET, 'HS256')
+    const newAccessToken = await sign({ sub: String(user.id), exp: nowSec + ACCESS_EXPIRY }, c.env.JWT_SECRET, 'HS256')
     setCookie(c, 'access_token', newAccessToken, { ...cookieBase, maxAge: ACCESS_EXPIRY })
 
     const { password_hash, ...safeUser } = user
@@ -188,6 +195,7 @@ auth.get('/auth/google/callback', async (c) => {
   const backendOrigin = new URL(c.req.url).origin
   const redirectUri   = `${backendOrigin}/auth/google/callback`
 
+  // code を Google のアクセストークンと交換
   const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -203,7 +211,8 @@ auth.get('/auth/google/callback', async (c) => {
   const tokenData = await tokenRes.json() as any
   if (!tokenRes.ok) return c.redirect(`${c.env.ALLOWED_ORIGIN}/login?error=oauth_failed`)
 
-  const userRes   = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+  // アクセストークンで Google のユーザー情報を取得
+  const userRes  = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
     headers: { Authorization: `Bearer ${tokenData.access_token}` },
   })
   const googleUser = await userRes.json() as any
@@ -211,24 +220,26 @@ auth.get('/auth/google/callback', async (c) => {
     return c.redirect(`${c.env.ALLOWED_ORIGIN}/login?error=oauth_failed`)
   }
 
+  // DB にユーザーが存在するか確認 → なければ新規作成
   const now = new Date().toISOString()
-  let user  = await c.env.DB.prepare(
-    'SELECT * FROM users WHERE email = ?'
+  let user = await c.env.DB.prepare(
+    'SELECT * FROM users WHERE email = ? AND delete_flag = 0'
   ).bind(googleUser.email).first() as any
 
   if (!user) {
-    const id = crypto.randomUUID()
-    await c.env.DB.prepare(`
-      INSERT INTO users (id, name, email, avatar_url, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).bind(id, googleUser.name ?? googleUser.email, googleUser.email, googleUser.picture ?? null, now).run()
+    const result = await c.env.DB.prepare(`
+      INSERT INTO users (email, password_hash, display_name, created_at, updated_at, delete_flag, version)
+      VALUES (?, ?, ?, ?, ?, 0, 1)
+    `).bind(googleUser.email, 'Google認証使用', googleUser.name ?? googleUser.email, now, now).run()
 
-    user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?').bind(id).first() as any
+    user = await c.env.DB.prepare('SELECT * FROM users WHERE id = ?')
+      .bind(result.meta.last_row_id).first() as any
   }
 
+  // JWT Cookie を発行してフロントにリダイレクト
   const nowSec = Math.floor(Date.now() / 1000)
-  const accessToken  = await sign({ sub: user.id, exp: nowSec + ACCESS_EXPIRY  }, c.env.JWT_SECRET, 'HS256')
-  const refreshToken = await sign({ sub: user.id, type: 'refresh', exp: nowSec + REFRESH_EXPIRY }, c.env.JWT_SECRET, 'HS256')
+  const accessToken  = await sign({ sub: String(user.id), exp: nowSec + ACCESS_EXPIRY  }, c.env.JWT_SECRET, 'HS256')
+  const refreshToken = await sign({ sub: String(user.id), type: 'refresh', exp: nowSec + REFRESH_EXPIRY }, c.env.JWT_SECRET, 'HS256')
 
   setCookie(c, 'access_token',  accessToken,  { ...cookieBase, maxAge: ACCESS_EXPIRY  })
   setCookie(c, 'refresh_token', refreshToken, { ...cookieBase, maxAge: REFRESH_EXPIRY })
