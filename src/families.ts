@@ -51,6 +51,23 @@ families.post('/', requireAuth, async (c) => {
     VALUES (?, ?, ?, 'owner', ?)
   `).bind(memberId, familyId, userId, now).run()
 
+  // デフォルトラベルを挿入
+  const defaultLabels = [
+    { name: '家族', color: '#4CAF50' },       // green
+    { name: '買い物', color: '#2196F3' },     // blue
+    { name: 'お出かけ', color: '#FF5722' },   // orange
+    { name: '仕事', color: '#9C27B0' },       // purple
+    { name: 'その他', color: '#FF9800' },     // yellow
+  ]
+
+  for (const label of defaultLabels) {
+    const labelId = crypto.randomUUID()
+    await c.env.DB.prepare(`
+      INSERT INTO labels (id, family_id, name, color, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).bind(labelId, familyId, label.name, label.color, now).run()
+  }
+
   const family = await c.env.DB.prepare('SELECT * FROM families WHERE id = ?')
     .bind(familyId).first()
 
