@@ -106,4 +106,27 @@ families.post('/join', requireAuth, async (c) => {
   return c.json({ family }, 200)
 })
 
+// ────────────────────────────────
+// PUT /families/me — 自宅住所を更新
+// ────────────────────────────────
+families.put('/me', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const { home_address } = await c.req.json()
+
+  const member = await c.env.DB.prepare(
+    'SELECT family_id FROM family_members WHERE user_id = ? LIMIT 1'
+  ).bind(userId).first() as any
+
+  if (!member) return c.json({ error: '家族グループに参加していません' }, 404)
+
+  await c.env.DB.prepare(
+    'UPDATE families SET home_address = ? WHERE id = ?'
+  ).bind(home_address ?? null, member.family_id).run()
+
+  const family = await c.env.DB.prepare('SELECT * FROM families WHERE id = ?')
+    .bind(member.family_id).first()
+
+  return c.json({ family }, 200)
+})
+
 export default families

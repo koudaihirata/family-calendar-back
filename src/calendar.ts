@@ -88,4 +88,113 @@ calendar.get('/labels', requireAuth, async (c) => {
   return c.json({ labels: results })
 })
 
+// ────────────────────────────────
+// GET /events/:id — 単一イベント取得
+// ────────────────────────────────
+calendar.get('/events/:id', requireAuth, async (c) => {
+  const userId  = c.get('userId')
+  const eventId = c.req.param('id')
+
+  const member = await c.env.DB.prepare(
+    'SELECT family_id FROM family_members WHERE user_id = ? LIMIT 1'
+  ).bind(userId).first() as any
+
+  if (!member) return c.json({ error: 'Unauthorized' }, 401)
+
+  const event = await c.env.DB.prepare(`
+    SELECT e.*, l.name AS label_name, l.color AS label_color
+    FROM events e
+    LEFT JOIN labels l ON e.label_id = l.id
+    WHERE e.id = ? AND e.family_id = ?
+  `).bind(eventId, member.family_id).first()
+
+  if (!event) return c.json({ error: 'イベントが見つかりません' }, 404)
+  return c.json({ event })
+})
+
+// ────────────────────────────────
+// PUT /events/:id — イベント更新
+// ────────────────────────────────
+calendar.put('/events/:id', requireAuth, async (c) => {
+  const userId  = c.get('userId')
+  const eventId = c.req.param('id')
+  const { title, start_at, end_at, label_id, location_name } = await c.req.json()
+
+  const member = await c.env.DB.prepare(
+    'SELECT family_id FROM family_members WHERE user_id = ? LIMIT 1'
+  ).bind(userId).first() as any
+
+  if (!member) return c.json({ error: 'Unauthorized' }, 401)
+
+  const existing = await c.env.DB.prepare(
+    'SELECT id FROM events WHERE id = ? AND family_id = ?'
+  ).bind(eventId, member.family_id).first()
+
+  if (!existing) return c.json({ error: 'イベントが見つかりません' }, 404)
+
+  const now = new Date().toISOString()
+  await c.env.DB.prepare(`
+    UPDATE events
+    SET title = ?, start_at = ?, end_at = ?, label_id = ?, location_name = ?, updated_at = ?
+    WHERE id = ?
+  `).bind(title, start_at, end_at, label_id ?? null, location_name ?? null, now, eventId).run()
+
+  const event = await c.env.DB.prepare(`
+    SELECT e.*, l.name AS label_name, l.color AS label_color
+    FROM events e LEFT JOIN labels l ON e.label_id = l.id
+    WHERE e.id = ?
+  `).bind(eventId).first()
+
+  return c.json({ event })
+})
+
+// ────────────────────────────────
+// POST /labels — ラベルを新規作成
+// ────────────────────────────────
+calendar.post('/labels', requireAuth, async (c) => {
+  const userId = c.get('userId')
+  const { name, color } = await c.req.json()
+
+  if (!name || !color) return c.json({ error: 'name・color は必須です' }, 400)
+
+  const member = await c.env.DB.prepare(
+    'SELECT family_id FROM family_members WHERE user_id = ? LIMIT 1'
+  ).bind(userId).first() as any
+
+  if (!member) return c.json({ error: '家族グループに参加していません' }, 404)
+
+  const id  = crypto.randomUUID()
+  const now = new Date().toISOString()
+
+  await c.env.DB.prepare(
+    'INSERT INTO labels (id, family_id, name, color, created_at) VALUES (?, ?, ?, ?, ?)'
+  ).bind(id, member.family_id, name, color, now).run()
+
+  const label = await c.env.DB.prepare('SELECT * FROM labels WHERE id = ?').bind(id).first()
+  return c.json({ label }, 201)
+})
+
+// ────────────────────────────────
+// DELETE /labels/:id — ラベルを削除
+// ────────────────────────────────
+calendar.delete('/labels/:id', requireAuth, async (c) => {
+  const userId  = c.get('userId')
+  const labelId = c.req.param('id')
+
+  const member = await c.env.DB.prepare(
+    'SELECT family_id FROM family_members WHERE user_id = ? LIMIT 1'
+  ).bind(userId).first() as any
+
+  if (!member) return c.json({ error: 'Unauthorized' }, 401)
+
+  const label = await c.env.DB.prepare(
+    'SELECT * FROM labels WHERE id = ? AND family_id = ?'
+  ).bind(labelId, member.family_id).first()
+
+  if (!label) return c.json({ error: 'ラベルが見つかりません' }, 404)
+
+  await c.env.DB.prepare('DELETE FROM labels WHERE id = ?').bind(labelId).run()
+  return c.json({ success: true })
+})
+
 export default calendar
